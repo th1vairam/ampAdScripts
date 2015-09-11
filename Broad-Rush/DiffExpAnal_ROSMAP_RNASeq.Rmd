@@ -1,0 +1,347 @@
+---
+title: "Differential expression analysis of ROSMAP RNASeq from DLPFC"
+author: "Thanneer Perumal"
+date: "`r date()`"
+output: html_document
+---
+  
+```{r libs, echo=FALSE, warning=FALSE, message=FALSE, include=FALSE}
+## It is assumed your working directory is where this file
+
+## Load required libraries
+library(synapseClient)
+library(ggplot2)
+library(reshape2)
+library(data.table)
+library(dplyr)
+library(stringr)
+library(limma)
+library(knitr)
+library(Biobase)
+library(GEOquery)
+library(RColorBrewer)
+library(gplots)
+library(WGCNA)
+library(psych)
+library(edgeR)
+library(xlsx)
+library(biomaRt)
+library(knit2synapse)
+
+## Requires ggdendro
+devtools::source_url("https://raw.githubusercontent.com/chr1swallace/random-functions/master/R/ggplot-heatmap.R")
+
+## Needs the dev branch
+library(rGithubClient)
+
+# knit2synapse::knitToFolderEntity(file = './DiffExpAnal_ROSMAP_RNASeq.Rmd', parentId = 'syn2397881', entityName = "Differential Expression Analysis of ROSMAP RNASeq based on Braaksc")
+
+synapseLogin()
+
+# source utility files from ../lib folder
+file.sources = list.files('../lib',pattern="*.R")
+file.sources = sapply(file.sources,function(x){return(paste('../lib',x,sep='/'))})
+tmp = sapply(file.sources,source,.GlobalEnv)
+
+options(xtable.type="html")
+
+knitr::opts_chunk$set(
+  echo=FALSE,
+  warning=FALSE,
+  message=FALSE,
+  error = FALSE,
+  tidy = FALSE)
+```
+
+```{r synapse.parameters, include=FALSE, cache=TRUE}
+# Synapse parameters
+parentId = 'syn2397881';
+
+activityName = 'Differential expression analysis';
+activityDescription = 'Differential expression analysis based on Braak staging';
+
+thisFileName <- 'DiffExpAnal_ROSMAP_RNASeq.Rmd'
+
+# Github link
+thisRepo <- getRepo(repository = "th1vairam/ampAdAcripts", ref="branch", refName='diffexp')
+thisFile <- getPermlink(repository = thisRepo, repositoryPath=paste0('Broad-Rush/',thisFileName))
+```
+### Data download
+Obtain count matrix and metadata from synapse.
+```{r download.data, cache=TRUE}
+# Download expression data
+COUNT_ID <- 'syn3505720';
+ALL_USED_IDs <- COUNT_ID
+COUNT_OBJ <- synGet(COUNT_ID)
+COUNT <- read.table(COUNT_OBJ@filePath,header=T,sep='\t',check.names = F)
+
+# Get clinical metadata
+METADATA.CLINICAL_ID <- 'syn3361786'; #'syn3191087'
+ALL_USED_IDs[length(ALL_USED_IDs)+1] = METADATA.CLINICAL_ID
+METADATA.CLINICAL_OBJ <- synGet(METADATA.CLINICAL_ID)
+METADATA.CLINICAL <- read.xlsx(METADATA.CLINICAL_OBJ@filePath, 1)
+
+# Get technical covariates
+METADATA.TECH <- read.csv('./ROSMAP_RNA_Seq_RIN_Sample_READS.csv')
+METADATA.TECH <- METADATA.TECH[!duplicated(METADATA.TECH$Projid),]
+
+# Match technical and clinical covariates
+ind <- intersect(METADATA.TECH$Projid,METADATA.CLINICAL$projid)
+METADATA.TECH <- METADATA.TECH[METADATA.TECH$Projid %in% ind,]
+METADATA.CLINICAL <- METADATA.CLINICAL[METADATA.CLINICAL$projid %in% ind,]
+METADATA <- merge(METADATA.TECH,METADATA.CLINICAL,by.x='Projid',by.y='projid',all=T)
+```
+
+### Data preprocessing
+```{r preprocess.data,cache=TRUE, echo=TRUE}
+# Remove samples with no cogdx
+METADATA <- METADATA %>%
+  filter(!is.na(RINcontinuous)) %>%
+  filter(!is.na(pmi))
+```
+
+```{r preprocess.data1,cache=TRUE}
+EXPR <- COUNT; #merge(COUNT1,COUNT2,by = 'gene_id',all=T)
+rownames(EXPR) <- EXPR$gene_id
+EXPR <- dplyr::select(EXPR,-gene_id,-tracking_id)
+
+# Match covariates to expression data
+METADATA <- dplyr::mutate(METADATA, user.id = paste(Sampleid,Batch,sep='_'))
+ind <- match(METADATA$user.id,colnames(EXPR))
+EXPR <- EXPR[,ind]
+```
+
+Relationship between cogdx-braaksc
+```{r cogdx.braaksc}
+kable(table(METADATA$cogdx, METADATA$braaksc))
+```
+### Covariate relation
+Determine relationship between covariates. 
+```{r covariates.clustering, cache=TRUE}
+FactorCovariates <- c("Batch","msex","apoe_genotype", "race", "spanish", "braaksc")
+ContCovariates <- c("RINcontinuous","age_first_ad_dx","age_death","age_at_visit_max","pmi","educ")
+# Following covairates are available but not used in this analysis: "ceradsc","cts_mmse30_first_ad_dx","cts_mmse30_lv"
+
+# Find inter relation between factor covariates
+COVARIATES = METADATA[,c(FactorCovariates,ContCovariates),drop=F]
+COVARIATES <- data.frame(lapply(COVARIATES,function(x){x <- sapply(x,function(y){str_replace_all(as.character(y),'\\+','')})}))
+rownames(COVARIATES) <- METADATA$Projid
+colnames(EXPR) <- METADATA$Projid
+
+# Convert factor covariates to factors
+COVARIATES[,FactorCovariates] = lapply(COVARIATES[,FactorCovariates], factor)
+COVARIATES[,ContCovariates] = lapply(COVARIATES[,ContCovariates], as.character)
+COVARIATES[,ContCovariates] = lapply(COVARIATES[,ContCovariates], as.numeric)
+```
+
+Covariates correlation
+
+```{r covariates.correlation, fig.width=10, fig.height=10}
+COVARIATES.CORRELATION = getAssociationStatistics(COVARIATES, PVAL = 1)
+ggheatmap.show(COVARIATES.CORRELATION$plot, col.width=0.3, row.width=0.15)
+```
+
+### Gene Filtering
+Retain genes with atleast 50% of the samples have >= 0 FPKM counts
+```{r gene.filtering, cache=TRUE}
+# Remove genes
+EXPR <- EXPR[(rowSums(EXPR>0)/dim(EXPR)[2] >= 0.5),]
+
+# To avoid taking log of zero add 1e-4 to the FPKM counts
+EXPR <- log2(EXPR+1e-3)
+```
+`r dim(EXPR)[1]` number of genes and `r dim(EXPR)[2]` number of samples are considered for the analysis
+
+### Significant Covariates
+Correlation between pca of normalised mRNA expression and covariates
+```{r preAdjusted.covariates, cache=TRUE}
+# Find correlation between PC's of gene expression with covariates
+DM = getDesignMatrix(COVARIATES, Intercept = F)
+DESIGN = getDesignMat2Fact(DM$design,FactorCovariates)
+rownames(DESIGN) = rownames(COVARIATES)
+preAdjustedSigCovars = runPCAandPlotCorrelations(EXPR, DESIGN,'non-normalized', isKeyPlot=TRUE)
+
+# Find significant covariates
+adjustCovars = designMatVarsToCovars(getCovariatesMap(DM),preAdjustedSigCovars$significantCovars)
+```
+
+Significant covariates to adjust at FDR 0.1 are `r adjustCovars`
+
+```{r preAdjustedSigCovars.NULL.ALL, fig.width=15, fig.height=8}
+preAdjustedSigCovars[["PC_res"]][[2]]$plotData
+```
+
+### Normalisation (custom design)
+Fitting a linear model with following variables braaksc, Batch, RINcontinuous, pmi
+```{r iterative.normalisation, cache=TRUE}
+postAdjustCovars <- c('braaksc', 'Batch','RINcontinuous','pmi')
+
+tmp <- paste('Using',paste(postAdjustCovars,collapse=','),'as fixed effects in the final model',sep=' ')
+
+# Post adjusted design matrix
+DM1 = getDesignMatrix(COVARIATES[,postAdjustCovars,drop=F],Intercept = F)
+DM1$design = DM1$design[,linColumnFinder(DM1$design)$indepCols]
+    
+# Re-calculate linear fit using new weights and new design
+FIT = lmFit(EXPR, design=DM1$design)
+
+# Residuals after normalisation
+RESIDUAL.GENE_EXPRESSION = residuals.MArrayLM(FIT,EXPR)
+
+# Find PC of residual gene expression and significant covariates that are highly correlated with PCs
+rownames(DESIGN) <- rownames(COVARIATES)
+residualSigCovars = runPCAandPlotCorrelations(RESIDUAL.GENE_EXPRESSION,
+                                              DESIGN,
+                                              'all adjusted design',
+                                              isKeyPlot=TRUE)
+```
+`r tmp`
+
+```{r residualSigCovars.manual.ALL, fig.width=15, fig.height=8}
+residualSigCovars[["PC_res"]][[2]]$plotData
+```
+
+### Differential Expression
+```{r contrast.fit, cache=TRUE, fig.height=10, fig.width=15}
+# Make contrast to check differential expression
+CONT.NAMES <- colnames(DM1$design)[grep('braaksc',colnames(DM1$design))]
+CONT.NAMES <- combn(CONT.NAMES,2)
+CONT.NAMES <- apply(CONT.NAMES,2,paste,collapse='-')
+
+CONT <- makeContrasts(contrasts=CONT.NAMES,levels=colnames(FIT$coefficients))
+
+# Refit contrasts
+FIT.CONTRAST <- contrasts.fit(FIT,CONT)
+  
+# Estimate moderated t-statistics
+FIT.CONTRAST <- eBayes(FIT.CONTRAST)
+  
+# Obtain all the differential expession combinations
+DEXP <- list()
+DEXP$logFC <- data.frame(row.names = rownames(EXPR))
+DEXP$adj.P.Val <- data.frame(row.names = rownames(EXPR))
+  
+p <- list()
+for (i in colnames(CONT)){
+  tmp <- topTable(FIT.CONTRAST, coef=i, number=dim(EXPR)[1])  
+  rnames = rownames(tmp)
+  tmp = mutate(tmp, diffexp = ifelse(logFC>0, 'UP','DOWN'), diffexp = ifelse(adj.P.Val > 0.05, 'NOT DE', diffexp))
+  rownames(tmp) = rnames
+  DEXP$logFC[,i] <- tmp[rownames(DEXP$logFC),'logFC']
+  DEXP$adj.P.Val[,i] <- tmp[rownames(DEXP$adj.P.Val),'adj.P.Val']
+  
+  p[[i]] <- ggplot(tmp, aes(x = logFC, y = -log10(adj.P.Val))) + geom_point(aes(color = diffexp)) + ggtitle(i)
+}
+  
+# Get number of significantly differentialy expressed genes with adj.P.Val <= 0.05 and abs(logFC) >= 0
+DEXP$SIG.EXP <- DEXP$adj.P.Val<=0.05 & abs(DEXP$logFC) >= 0   
+DEXP$NUM.SIG.EXP <- colSums(DEXP$SIG.EXP, na.rm=T)
+
+multiplot(plotlist = p, cols = 7)
+```
+Interpretation of braaksc scores
+
+Description Braak Stage: This assessment is a semiquantitative measure of neurofibrillary tangles. Diagnosis includes algorithm and neuropathologist's opinion.
+
+value coding
+----- ------
+ 0 0
+ 1 I
+ 2 II
+ 3 III
+ 4 IV
+ 5 V
+ 6 VI
+ 8 DK
+ 9 Missing
+
+References: 
+1. Braak H, Braak E. Neuropathological staging of Alzheimer related changes. Acta Neuropathol (Berl). 1991;82:239-259. PMID: 175955.
+2. Neuropathology of older persons without cognitive impairment from two community-based studies. Bennett DA, Schneider JA, Arvanitakis Z, Kelly JF, Aggarwal NT, Shah RC, Wilson RS Journal: Neurology 2006 Jun 27 ; 66(12) 1837-44
+3. Cholinergic plasticity in hippocampus of individuals with mild cognitive impairment: correlation with Alzheimer's neuropathology. Ikonomovic MD, Mufson EJ, Wuu J, Cochran EJ, Bennett DA, DeKosky ST Journal: Journal of Alzheimer's disease : JAD 2003 Feb; 5(1) 39-48
+4. Analysis of postmortem ventricular cerebrospinal fluid from patients with and without dementia indicates association of vitamin E with neuritic plaques and specific measures of cognitive performance. Hensley K, Barnes LL, Christov A, Tangney C, Honer WG, Schneider JA, Bennett DA, Morris MC Journal: Journal of Alzheimer's disease : JAD 2011 ; 24(4) 767-74
+
+```{r print.fc.pval}
+# Print results
+tmp <- as.data.frame(DEXP$NUM.SIG.EXP)
+colnames(tmp) <- 'Diff exp probes at FDR <= 0.05'
+kable(tmp)
+
+# Get fold change and pvalues
+FC <- DEXP$logFC
+colnames(FC) <- paste('ROSMAP.RNASeq.PrefrontalCortex',colnames(FC),sep='.')
+FC <- rownameToFirstColumn(FC,"EnsembleID")
+FC[,1] <- str_split_fixed(FC$EnsembleID,"\\.",n=2)[,1]
+
+PVAL <- DEXP$adj.P.Val
+colnames(PVAL) <- paste('ROSMAP.RNASeq.PrefrontalCortex',colnames(PVAL),sep='.')
+PVAL <- rownameToFirstColumn(PVAL,"EnsembleID")
+PVAL[,1] <- str_split_fixed(PVAL$EnsembleID,"\\.",n=2)[,1]
+
+# Residuals after normalisation but adding back cogdx
+REXPR = calcResiduals(EXPR, DM1$design, varsToAddBackIn = c("braaksc0.0", "braaksc1.0", "braaksc2.0", "braaksc3.0", "braaksc4.0", "braaksc5.0", "braaksc6.0"))
+REXPR <- rownameToFirstColumn(REXPR,"EnsembleID")
+REXPR[,1] <- str_split_fixed(REXPR$EnsembleID,"\\.",n=2)[,1]
+```
+
+Sample clustering to check for outliers
+```{r sample.clustering, fig.height=15, fig.width=20}
+# Find principal components of expression to plot
+PC <- prcomp(REXPR[,-(1)])
+
+# Plot first 2 PCs
+plotdata <- data.frame(Projid=rownames(PC$rotation), 
+                       PC1=PC$rotation[,1], 
+                       PC2=PC$rotation[,2])
+
+plotdata <- merge(plotdata, METADATA, by="Projid")
+plotdata <- mutate(plotdata, labels = '');#ifelse(Diffname_short == '',as.character(UID),'')) 
+
+p <- ggplot(plotdata, aes(x=PC1, y=PC2))
+p <- p + geom_point(aes(color=factor(braaksc), shape=factor(cogdx), size=as.numeric(pmi)))
+p <- p + theme_bw() + theme(legend.position="top") 
+print(p)
+```
+
+```{r get.gene.symbols, cache=TRUE}
+# Define biomart object
+mart <- useMart(biomart = "ensembl", dataset = "hsapiens_gene_ensembl")
+
+# Query biomart
+Ensemble2HGNC <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol"),
+                       filters = "ensembl_gene_id", values = FC$EnsembleID,
+                       mart = mart)
+
+FC <- merge(Ensemble2HGNC,FC,by.x='ensembl_gene_id',by.y='EnsembleID',all=T)
+PVAL <- merge(Ensemble2HGNC,PVAL,by.x='ensembl_gene_id',by.y='EnsembleID',all=T)
+REXPR <- merge(Ensemble2HGNC,REXPR,by.x='ensembl_gene_id',by.y='EnsembleID',all=T)
+```
+
+### Store files in synapse
+```{r synapse.store, include=FALSE, eval=TRUE}
+# Code
+CODE <- Folder(name = "Differential Expression Analysis of ROSMAP RNASeq based on Braaksc", parentId = parentId)
+CODE <- synStore(CODE)
+      
+# Fold change
+FC <- FC[, unique(colnames(FC))]
+write.table(FC, file='./FoldChange_ROSMAP_RNASeq.tsv', sep='\t', row.names=F, quote=F)
+FC_OBJ <- File('./FoldChange_ROSMAP_RNASeq.tsv',name = 'Differential Expression Analysis ROSMAP RNASeq logFC',parentId = CODE$properties$id)
+FC_OBJ <- synStore(FC_OBJ, used = ALL_USED_IDs, activityName = activityName, executed=thisFile, activityDescription = activityDescription)
+    
+# Pvalue
+PVAL <- PVAL[, unique(colnames(PVAL))]
+write.table(PVAL, file='./AdjustedPval_ROSMAP_RNASeq.tsv', sep='\t', row.names=F, quote=F)
+PVAL_OBJ <- File('./AdjustedPval_ROSMAP_RNASeq.tsv',name = 'Differential Expression Analysis ROSMAP RNASeq adjPval',parentId = CODE$properties$id)
+PVAL_OBJ <- synStore(PVAL_OBJ, used = ALL_USED_IDs, activityName = activityName, executed=CODE$properties$id, activityDescription = activityDescription)
+
+# Residual gene expression
+write.table(REXPR, file='./ResidualGeneExpression.tsv', sep='\t', row.names=F, quote=F)
+REXPR_OBJ <- File('./ResidualGeneExpression.tsv',name = 'Differential Expression Analysis ROSMAP RNASeq residuals',parentId = CODE$properties$id)
+REXPR_OBJ <- synStore(REXPR_OBJ, used = ALL_USED_IDs, activityName = activityName, executed=CODE$properties$id, activityDescription = activityDescription)
+```
+|  *Results*            |  *SynapseID*                    |
+|  -------              |   ---------                     |
+|  Log fold change      |  `r FC_OBJ$properties$id`       |
+|  Adjusted pvalues     |  `r PVAL_OBJ$properties$id`     |
+|  Residuals expression |  `r REXPR_OBJ$properties$id`    |
