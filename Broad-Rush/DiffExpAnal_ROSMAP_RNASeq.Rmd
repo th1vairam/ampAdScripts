@@ -63,7 +63,7 @@ activityDescription = 'Differential expression analysis based on Braak staging';
 thisFileName <- 'DiffExpAnal_ROSMAP_RNASeq.Rmd'
 
 # Github link
-thisRepo <- getRepo(repository = "th1vairam/ampAdAcripts", ref="branch", refName='diffexp')
+thisRepo <- getRepo(repository = "th1vairam/ampAdScripts", ref="branch", refName='diffexp')
 thisFile <- getPermlink(repository = thisRepo, repositoryPath=paste0('Broad-Rush/',thisFileName))
 ```
 ### Data download
@@ -202,7 +202,7 @@ residualSigCovars[["PC_res"]][[2]]$plotData
 ```
 
 ### Differential Expression
-```{r contrast.fit, cache=TRUE, fig.height=10, fig.width=15}
+```{r contrast.fit, cache=TRUE, fig.height=20, fig.width=25}
 # Make contrast to check differential expression
 CONT.NAMES <- colnames(DM1$design)[grep('braaksc',colnames(DM1$design))]
 CONT.NAMES <- combn(CONT.NAMES,2)
@@ -243,17 +243,17 @@ Interpretation of braaksc scores
 
 Description Braak Stage: This assessment is a semiquantitative measure of neurofibrillary tangles. Diagnosis includes algorithm and neuropathologist's opinion.
 
-value coding
------ ------
- 0 0
- 1 I
- 2 II
- 3 III
- 4 IV
- 5 V
- 6 VI
- 8 DK
- 9 Missing
+|*value*| *coding*  |
+|-----  | ------    |
+|   0   |   0       |
+|   1   |   I       |
+|   2   |   II      |
+|   3   |   III     |
+|   4   |   IV      |
+|   5   |   V       |
+|   6   |   VI      |
+|   8   |   DK      |
+|   9   |   Missing |
 
 References: 
 1. Braak H, Braak E. Neuropathological staging of Alzheimer related changes. Acta Neuropathol (Berl). 1991;82:239-259. PMID: 175955.
@@ -285,7 +285,7 @@ REXPR[,1] <- str_split_fixed(REXPR$EnsembleID,"\\.",n=2)[,1]
 ```
 
 Sample clustering to check for outliers
-```{r sample.clustering, fig.height=15, fig.width=20}
+```{r sample.clustering, fig.height=10, fig.width=10}
 # Find principal components of expression to plot
 PC <- prcomp(REXPR[,-(1)])
 
